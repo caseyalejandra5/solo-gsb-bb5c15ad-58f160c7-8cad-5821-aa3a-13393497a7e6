@@ -52,6 +52,16 @@ def smallest_aligned_network(
     return None
 
 
+def shrink_to(net: Network, prefix_len: int) -> Network:
+    """缩小到指定前缀长度：保留原网络地址，尾部空间随之释放。"""
+    return ipaddress.ip_network(f"{net.network_address}/{prefix_len}")
+
+
+def grow_to(net: Network, prefix_len: int) -> Network:
+    """扩展到指定前缀长度：返回唯一包含原网段的目标前缀。"""
+    return net.supernet(new_prefix=prefix_len)
+
+
 def summarize_free(free: list[tuple[int, int]], version: int) -> list[str]:
     """把空闲区间归并为最小 CIDR 集合。"""
     addr_cls = IPv4Address if version == 4 else IPv6Address

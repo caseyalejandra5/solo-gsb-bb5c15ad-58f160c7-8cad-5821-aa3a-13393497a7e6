@@ -25,3 +25,10 @@ class AllocateBody(BaseModel):
 
 class ReleaseBody(BaseModel):
     cidr: str
+
+
+class ResizeBody(BaseModel):
+    """调整已分配网段的前缀长度：缩小保留网络地址，扩展取唯一包含原网段的前缀。"""
+
+    cidr: str
+    new_prefix_len: int

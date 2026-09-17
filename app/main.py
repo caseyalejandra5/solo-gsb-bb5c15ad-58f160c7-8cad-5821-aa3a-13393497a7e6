@@ -14,7 +14,14 @@ from fastapi import FastAPI, HTTPException
 
 from . import logic
 from .db import connect, init_db
-from .schemas import AllocateBody, AllocRequest, PoolCreate, ReleaseBody, UnavailableCreate
+from .schemas import (
+    AllocateBody,
+    AllocRequest,
+    PoolCreate,
+    ReleaseBody,
+    ResizeBody,
+    UnavailableCreate,
+)
 
 
 @asynccontextmanager
@@ -434,6 +441,67 @@ def release(name: str, body: ReleaseBody) -> dict:
                 status_code=404, detail=f"地址池 {name!r} 中不存在已分配网段 {net}"
             )
         return {"pool": name, "released": str(net)}
+
+
+@app.post("/pools/{name}/allocations/resize")
+def resize_allocation(name: str, body: ResizeBody) -> dict:
+    """原子调整已分配网段的前缀长度，返回 ``old_cidr`` 与 ``new_cidr``。
+
+    缩小（``new_prefix_len`` 更大）时保留原网络地址，尾部空间立即释放；
+    扩展（``new_prefix_len`` 更小）时改为唯一包含原网段的目标前缀，仅当
+    目标仍在池内且新增范围不与其他分配或不可用段重叠才成功；前后缀长度
+    相等时为幂等空操作。校验与更新在同一 ``BEGIN IMMEDIATE`` 事务内完成，
+    任一校验失败整体回滚，原分配不变；成功后分配集合变化，既有计划的
+    状态指纹自然失效，快照差异表现为一次移除加一次新增。
+    """
+    old_net = parse_or_400(body.cidr)
+    with write_tx() as conn:
+        pool = get_pool_or_404(conn, name)
+        pool_net = logic.parse_network(pool["cidr"])
+        max_len = logic.max_prefixlen(pool["version"])
+        if not pool_net.prefixlen <= body.new_prefix_len <= max_len:
+            raise HTTPException(
+                status_code=400,
+                detail=f"new_prefix_len {body.new_prefix_len} 非法："
+                       f"必须在 [{pool_net.prefixlen}, {max_len}] 之间",
+            )
+        row = conn.execute(
+            "SELECT id, prefix_len FROM allocations WHERE pool_id = ? AND cidr = ?",
+            (pool["id"], str(old_net)),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"地址池 {name!r} 中不存在已分配网段 {old_net}",
+            )
+
+        if body.new_prefix_len > row["prefix_len"]:
+            # 缩小：保留原网络地址，尾部空间随更新落库即释放。
+            new_net = logic.shrink_to(old_net, body.new_prefix_len)
+        elif body.new_prefix_len < row["prefix_len"]:
+            # 扩展：唯一包含原网段的 new_prefix_len 前缀。
+            new_net = logic.grow_to(old_net, body.new_prefix_len)
+            if not new_net.subnet_of(pool_net):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"扩展后的目标网段 {new_net} 超出地址池 {pool_net} 范围",
+                )
+            for occ in load_occupied(conn, pool["id"]):
+                if occ == old_net:
+                    continue  # 跳过被调整的原分配自身
+                if new_net.overlaps(occ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"扩展后的目标网段 {new_net} 与已登记网段 {occ} 重叠",
+                    )
+        else:
+            new_net = old_net  # 前缀长度不变：幂等空操作
+
+        conn.execute(
+            "UPDATE allocations SET cidr = ?, prefix_len = ? WHERE id = ?",
+            (str(new_net), new_net.prefixlen, row["id"]),
+        )
+        return {"pool": name, "old_cidr": str(old_net), "new_cidr": str(new_net)}
 
 
 # ---------------------------------------------------------------------------

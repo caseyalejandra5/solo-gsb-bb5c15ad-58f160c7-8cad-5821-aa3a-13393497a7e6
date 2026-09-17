@@ -7,6 +7,7 @@
 - 创建 IPv4 / IPv6 地址池，并登记池内不可用子网
 - 严格校验：拒绝**越界**、**地址族（版本）不符**及**任意重叠**（池与池、不可用段、已分配段之间）
 - 按前缀长度申请：自动从当前空闲空间选择**网络地址最小的对齐子网**
+- 分配网段原子调整：缩小保留原网络地址并释放尾部空间；扩展改为唯一包含原网段的目标前缀，校验与更新在同一事务内完成，失败不改变原分配
 - 批量申请：同一事务内全部成功，否则整体回滚、不产生任何分配
 - 两阶段分配计划：先创建计划（预选子网、10 分钟有效期、不占用地址），确认无误后再一次性提交落库
 - 池快照与差异比较：为任意时刻的 allocations / unavailable 建立**不可变快照**，随时比较当前状态，输出新增 / 移除的 CIDR 及已分配、剩余地址数的有符号增量
@@ -58,6 +59,14 @@ curl -s http://localhost:8000/pools/eng
 curl -s -X POST http://localhost:8000/pools/eng/release \
   -H 'Content-Type: application/json' \
   -d '{"cidr": "10.0.0.128/26"}'
+
+# 6b. 原子调整已分配网段：缩小保留网络地址、释放尾部空间；
+#     扩展改为唯一包含原网段的目标前缀（目标越出池或新增范围与
+#     其他分配 / 不可用段重叠时失败，原分配不变）
+curl -s -X POST http://localhost:8000/pools/eng/allocations/resize \
+  -H 'Content-Type: application/json' \
+  -d '{"cidr": "10.0.0.224/27", "new_prefix_len": 28}'
+# => {"pool": "eng", "old_cidr": "10.0.0.224/27", "new_cidr": "10.0.0.224/28"}
 
 # 7. IPv6 地址池
 curl -s -X POST http://localhost:8000/pools \
@@ -132,6 +141,7 @@ curl -s http://localhost:8000/pools/eng/snapshots/<snapshot_id>/diff
 | `DELETE` | `/pools/{name}` | 删除地址池（级联删除其不可用段与分配记录） |
 | `POST` | `/pools/{name}/unavailable` | 登记不可用子网 `{cidr}` |
 | `POST` | `/pools/{name}/allocations` | 申请子网 `{requests: [{prefix_len, count?}]}`，批量原子生效 |
+| `POST` | `/pools/{name}/allocations/resize` | 原子调整已分配网段 `{cidr, new_prefix_len}`：缩小保留网络地址并释放尾部，扩展取唯一包含原网段的目标前缀（须在池内且新增范围无重叠），返回 `{old_cidr, new_cidr}` |
 | `POST` | `/pools/{name}/plans` | 创建分配计划（请求体同上）：预选子网并返回 `{plan_id, cidrs, expires_at}`，不占用地址 |
 | `POST` | `/pools/{name}/plans/{plan_id}/commit` | 提交计划：未过期、未提交且池状态未变时原子落库，否则 409 |
 | `POST` | `/pools/{name}/snapshots` | 创建不可变快照：在一个 `BEGIN IMMEDIATE` 事务内保存按 CIDR 排序的 allocations 与 unavailable，返回 `snapshot_id` |
@@ -143,9 +153,9 @@ curl -s http://localhost:8000/pools/eng/snapshots/<snapshot_id>/diff
 
 | 状态码 | 场景 |
 | --- | --- |
-| `400` | CIDR 格式非法、越界、地址族（版本）不符、前缀长度非法 |
-| `404` | 地址池不存在、释放的网段不在已分配列表中、计划不存在，或快照不存在（含快照归属其他地址池） |
-| `409` | 任意重叠（池 / 不可用段 / 已分配段）、名称冲突、剩余空间不足（批量申请整体回滚）；计划已过期、已提交或创建后池状态已变化 |
+| `400` | CIDR 格式非法、越界、地址族（版本）不符、前缀长度非法（含 resize 的 `new_prefix_len` 超出 `[池前缀, 地址族上限]`） |
+| `404` | 地址池不存在、释放或调整的网段不在已分配列表中、计划不存在，或快照不存在（含快照归属其他地址池） |
+| `409` | 任意重叠（池 / 不可用段 / 已分配段，含 resize 扩展后的目标网段与其他分配或不可用段重叠）、名称冲突、剩余空间不足（批量申请整体回滚）；计划已过期、已提交或创建后池状态已变化 |
 | `422` | 请求体结构不合法（字段缺失、类型错误等） |
 
 ## 本地开发（不用 Docker）
@@ -167,5 +177,6 @@ pytest
 - **事务与并发**：所有写操作在 `BEGIN IMMEDIATE` 事务中执行，SQLite 将并发写串行化；批量申请中任何一步失败都会回滚整个事务，因此要么全部落库，要么不产生任何分配，并发申请也不会得到重叠网段。
 - **两阶段计划**：`POST /pools/{name}/plans` 用与直接分配完全相同的选路规则预选子网，把结果（CIDR 列表、10 分钟 `expires_at`、创建时刻的池状态指纹）持久化到 `plans` 表，但不写入 `allocations`，因此计划本身不占用地址，也不影响直接分配。`POST /pools/{name}/plans/{plan_id}/commit` 在同一 `BEGIN IMMEDIATE` 事务内依次校验：计划未提交、未过期、池状态指纹与创建时一致（即分配项与不可用段均未变化），全部满足才按计划批量插入并标记 `committed`；任一不满足返回 409 且不产生任何分配，每个计划只能成功提交一次。计划有效期默认 600 秒，可用环境变量 `CIDR_PLAN_TTL_SECONDS` 调整。
 - **释放合并**：空闲空间由占用集合动态计算，状态接口用 `ipaddress.collapse_addresses` 输出最小 CIDR 集合，释放后相邻空闲段自然重新合并，无需额外维护。
+- **网段原子调整**：`POST /pools/{name}/allocations/resize` 在同一 `BEGIN IMMEDIATE` 事务内完成全部校验与更新：缩小时以原网络地址按新前缀就地更新，尾部空间随事务提交立即释放、可再分配；扩展时目标为唯一包含原网段的 `new_prefix_len` 前缀（`supernet`），仅当校验目标仍在池内且新增范围不与其他分配或不可用段重叠才落库，否则整体回滚、原分配不变；前后缀长度相等时为幂等空操作。调整通过一次 `UPDATE` 修改 allocations 行，分配集合随之变化：既有计划的状态指纹（分配项与不可用段的有序摘要）自然失效、提交返回 409，快照差异表现为一次 `removed`（旧 CIDR）加一次 `added`（新 CIDR）。
 - **池快照与差异**：`POST /pools/{name}/snapshots` 在单个 `BEGIN IMMEDIATE` 事务内读取并分别保存按 CIDR（网络地址升序）排序的 allocations 与 unavailable 到 `snapshots` / `snapshot_allocations` / `snapshot_unavailable` 三张表；快照只有创建入口、没有任何修改或删除入口，因此不可变，并经外键 `ON DELETE CASCADE` 归属地址池——删除池时快照级联删除，同名新池不继承旧快照。`GET /pools/{name}/snapshots/{snapshot_id}/diff` 在单个读事务（一次 `BEGIN`，WAL 下读到一致快照）内取快照与当前状态并做集合差：`added` 为当前有、快照无，`removed` 为快照有、当前无；同一 CIDR 由分配转为不可用（或反向）时在两个集合中身份不同，因此会同时记入对应类别的 `removed` 与 `added`。已分配地址数为各网段 `num_addresses` 之和，剩余地址数由"地址池 − 不可用段 − 已分配段"的空闲闭区间求和，二者均同时给出 `snapshot`、`current` 与有符号增量 `delta = current − snapshot`（新增占用时剩余增量为负）。快照只记录状态、不参与分配或计划校验，不改变现有分配与计划语义。
 - **存储**：SQLite（WAL 模式），路径由环境变量 `CIDR_DB_PATH` 指定，默认 `./cidr.db`，Docker 中为 `/data/cidr.db`。表结构通过 `CREATE TABLE IF NOT EXISTS` 幂等创建，启动时自动补齐快照相关表，旧数据库无需迁移。
