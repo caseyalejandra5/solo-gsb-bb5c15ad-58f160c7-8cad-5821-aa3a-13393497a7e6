@@ -109,3 +109,95 @@ def test_concurrent_plan_commits_only_one_succeeds(tmp_path):
 
         st = httpx.get(f"{base}/pools/eng", timeout=30).json()
         assert [a["cidr"] for a in st["allocations"]] == plan["cidrs"]
+
+
+def test_concurrent_resizes_disjoint_targets_both_succeed(tmp_path):
+    """两个互不冲突的扩展并发执行：BEGIN IMMEDIATE 串行化后都应成功，无丢失更新。"""
+    with run_server(tmp_path / "conc-resize.db") as base:
+        httpx.post(f"{base}/pools", json={"name": "eng", "cidr": "10.0.0.0/24"}).raise_for_status()
+
+        def alloc(prefix_len):
+            r = httpx.post(
+                f"{base}/pools/eng/allocations",
+                json={"requests": [{"prefix_len": prefix_len}]},
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()["allocated"][0]
+
+        def release(cidr):
+            httpx.post(
+                f"{base}/pools/eng/release", json={"cidr": cidr}, timeout=30
+            ).raise_for_status()
+
+        # 目标：留下 0/28 与 128/28 两个分配。先占满 0..127（两个 /26），
+        # 再分配 /28 得到 128/28；释放一个 /26 让首个 /28 落到 0/28。
+        assert alloc(26) == "10.0.0.0/26"
+        assert alloc(26) == "10.0.0.64/26"
+        assert alloc(28) == "10.0.0.128/28"
+        release("10.0.0.0/26")
+        release("10.0.0.64/26")
+        assert alloc(28) == "10.0.0.0/28"
+        # 当前分配：0/28、128/28
+
+        def resize(payload):
+            return httpx.post(
+                f"{base}/pools/eng/allocations/resize", json=payload, timeout=30
+            ).status_code
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            codes = list(ex.map(resize, [
+                {"cidr": "10.0.0.0/28", "new_prefix_len": 27},
+                {"cidr": "10.0.0.128/28", "new_prefix_len": 27},
+            ]))
+
+        assert sorted(codes) == [200, 200], codes
+        st = httpx.get(f"{base}/pools/eng", timeout=30).json()
+        cidrs = sorted(a["cidr"] for a in st["allocations"])
+        assert cidrs == ["10.0.0.0/27", "10.0.0.128/27"]
+        nets = [ipaddress.ip_network(c) for c in cidrs]
+        assert not nets[0].overlaps(nets[1])
+
+
+def test_concurrent_resizes_competing_targets_exactly_one_succeeds(tmp_path):
+    """两个扩展的目标互相排斥：无论谁先拿到写锁，都恰好一个成功，结果无重叠。
+
+    初始分配 0/27 与 32/28：
+    - 0/27 -> 0/26：目标包含 32/28，因此 32/28 仍在时必被挡（409）；
+    - 32/28 -> 32/27：目标 32..63 不包含 0/27，因此 0/27 仍在时可以成功。
+    串行化后若后者先提交则前者失败；若前者先拿到锁，它自身校验失败回滚，
+    后者随后成功——两种交错结果一致：恰好一次 200，最终为相邻不重叠的
+    0/27 与 32/27。
+    """
+    with run_server(tmp_path / "conc-resize-collide.db") as base:
+        httpx.post(f"{base}/pools", json={"name": "eng", "cidr": "10.0.0.0/24"}).raise_for_status()
+        r = httpx.post(
+            f"{base}/pools/eng/allocations", json={"requests": [{"prefix_len": 27}]},
+            timeout=30,
+        )
+        r.raise_for_status()
+        assert r.json()["allocated"] == ["10.0.0.0/27"]
+        r = httpx.post(
+            f"{base}/pools/eng/allocations", json={"requests": [{"prefix_len": 28}]},
+            timeout=30,
+        )
+        r.raise_for_status()
+        assert r.json()["allocated"] == ["10.0.0.32/28"]
+
+        def resize(payload):
+            return httpx.post(
+                f"{base}/pools/eng/allocations/resize", json=payload, timeout=30
+            ).status_code
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            codes = list(ex.map(resize, [
+                {"cidr": "10.0.0.0/27", "new_prefix_len": 26},
+                {"cidr": "10.0.0.32/28", "new_prefix_len": 27},
+            ]))
+
+        assert sorted(codes) == [200, 409], codes
+        st = httpx.get(f"{base}/pools/eng", timeout=30).json()
+        cidrs = sorted(a["cidr"] for a in st["allocations"])
+        assert cidrs == ["10.0.0.0/27", "10.0.0.32/27"], cidrs
+        nets = [ipaddress.ip_network(c) for c in cidrs]
+        assert not nets[0].overlaps(nets[1])

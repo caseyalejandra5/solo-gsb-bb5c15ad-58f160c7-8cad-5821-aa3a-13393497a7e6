@@ -14,7 +14,14 @@ from fastapi import FastAPI, HTTPException
 
 from . import logic
 from .db import connect, init_db
-from .schemas import AllocateBody, AllocRequest, PoolCreate, ReleaseBody, UnavailableCreate
+from .schemas import (
+    AllocateBody,
+    AllocRequest,
+    PoolCreate,
+    ReleaseBody,
+    ResizeBody,
+    UnavailableCreate,
+)
 
 
 @asynccontextmanager
@@ -339,6 +346,105 @@ def allocate(name: str, body: AllocateBody) -> dict:
                 (pool["id"], str(net), net.prefixlen),
             )
         return {"pool": name, "allocated": [str(n) for n in allocated]}
+
+
+@app.post("/pools/{name}/allocations/resize")
+def resize_allocation(name: str, body: ResizeBody) -> dict:
+    """原子调整已分配网段的前缀长度。
+
+    缩小（new_prefix_len 更大）时保留原网络地址并释放尾部空间；扩展
+    （new_prefix_len 更小）时改为唯一包含原网段的目标前缀父网。仅当目标仍在
+    地址池内、且扩展新增范围不与其他分配或不可用段重叠时才成功。所有校验与
+    UPDATE 都在同一个 ``BEGIN IMMEDIATE`` 事务内完成，任一条件不满足即整体
+    回滚，原分配保持不变；成功后池状态指纹自然变化，调整前创建的计划随之失效。
+    """
+    net = parse_or_400(body.cidr)
+    with write_tx() as conn:
+        pool = get_pool_or_404(conn, name)
+        pool_net = logic.parse_network(pool["cidr"])
+
+        if net.version != pool["version"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"地址族不符：地址池为 IPv{pool['version']}，子网为 IPv{net.version}",
+            )
+        max_len = logic.max_prefixlen(pool["version"])
+        if not pool_net.prefixlen <= body.new_prefix_len <= max_len:
+            raise HTTPException(
+                status_code=400,
+                detail=f"new_prefix_len {body.new_prefix_len} 非法："
+                       f"必须在 [{pool_net.prefixlen}, {max_len}] 之间",
+            )
+
+        row = conn.execute(
+            "SELECT cidr, prefix_len FROM allocations WHERE pool_id = ? AND cidr = ?",
+            (pool["id"], str(net)),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=404, detail=f"地址池 {name!r} 中不存在已分配网段 {net}"
+            )
+        if body.new_prefix_len == row["prefix_len"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"new_prefix_len {body.new_prefix_len} 与当前前缀长度相同，无需调整",
+            )
+
+        target = logic.resize_network(net, body.new_prefix_len, pool["version"])
+        if not target.subnet_of(pool_net):
+            raise HTTPException(
+                status_code=409,
+                detail=f"扩展后的目标网段 {target} 超出地址池 {pool_net} 范围，"
+                       f"调整已回滚",
+            )
+
+        if body.new_prefix_len < row["prefix_len"]:
+            # 扩展：新增范围（目标父网减去原子网）不得与其他分配或不可用段重叠。
+            # 目标 CIDR 已被其他分配占用时单独给出 409（正常情况下与下方重叠检查
+            # 重合；并发下另一事务可能在本事务读取后抢先写入，此时 UPDATE 也会
+            # 触发 UNIQUE(pool_id, cidr)，先显式拦截以返回稳定的 409）。
+            if conn.execute(
+                "SELECT 1 FROM allocations WHERE pool_id = ? AND cidr = ?",
+                (pool["id"], str(target)),
+            ).fetchone():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"目标网段 {target} 已被其他分配占用，调整已回滚",
+                )
+            others = [
+                occ
+                for occ in load_occupied(conn, pool["id"])
+                if str(occ) != str(net)
+            ]
+            for occ in others:
+                if target.overlaps(occ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"扩展后的目标网段 {target} 与已登记网段 {occ} 重叠，"
+                               f"调整已回滚",
+                    )
+
+        try:
+            cur = conn.execute(
+                "UPDATE allocations SET cidr = ?, prefix_len = ? "
+                "WHERE pool_id = ? AND cidr = ?",
+                (str(target), target.prefixlen, pool["id"], str(net)),
+            )
+        except sqlite3.IntegrityError:
+            # 并发下另一事务已抢先占用目标 CIDR（UNIQUE(pool_id, cidr)）：
+            # 事务回滚，原分配保持不变。
+            raise HTTPException(
+                status_code=409,
+                detail=f"目标网段 {target} 已被其他分配占用，调整已回滚",
+            )
+        if cur.rowcount == 0:
+            # 事务开头确认过原分配存在；这里消失说明它在本事务等待写锁期间被
+            # 另一写事务改动（例如已被扩展为包含本 CIDR 的父网），属并发冲突。
+            raise HTTPException(
+                status_code=409,
+                detail=f"原分配 {net} 在调整过程中已被其他事务改动，调整已回滚",
+            )
+        return {"pool": name, "old_cidr": str(net), "new_cidr": str(target)}
 
 
 # ---------------------------------------------------------------------------

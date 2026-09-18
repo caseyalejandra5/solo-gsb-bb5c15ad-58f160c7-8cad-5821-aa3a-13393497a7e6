@@ -7,6 +7,7 @@
 - 创建 IPv4 / IPv6 地址池，并登记池内不可用子网
 - 严格校验：拒绝**越界**、**地址族（版本）不符**及**任意重叠**（池与池、不可用段、已分配段之间）
 - 按前缀长度申请：自动从当前空闲空间选择**网络地址最小的对齐子网**
+- 分配网段原子调整：`POST /pools/{name}/allocations/resize` 原地修改已有分配的前缀长度——缩小保留原网络地址并释放尾部空间，扩展改为唯一包含原网段的目标前缀父网；校验与更新在同一 `BEGIN IMMEDIATE` 事务内完成，失败整体回滚
 - 批量申请：同一事务内全部成功，否则整体回滚、不产生任何分配
 - 两阶段分配计划：先创建计划（预选子网、10 分钟有效期、不占用地址），确认无误后再一次性提交落库
 - 池快照与差异比较：为任意时刻的 allocations / unavailable 建立**不可变快照**，随时比较当前状态，输出新增 / 移除的 CIDR 及已分配、剩余地址数的有符号增量
@@ -58,6 +59,20 @@ curl -s http://localhost:8000/pools/eng
 curl -s -X POST http://localhost:8000/pools/eng/release \
   -H 'Content-Type: application/json' \
   -d '{"cidr": "10.0.0.128/26"}'
+
+# 6.1 原子调整已分配网段 {cidr, new_prefix_len}
+# 缩小（new_prefix_len 更大）：保留原网络地址，尾部空间立即释放
+curl -s -X POST http://localhost:8000/pools/eng/allocations/resize \
+  -H 'Content-Type: application/json' \
+  -d '{"cidr": "10.0.0.128/26", "new_prefix_len": 28}'
+# => {"pool": "eng", "old_cidr": "10.0.0.128/26", "new_cidr": "10.0.0.128/28"}
+#
+# 扩展（new_prefix_len 更小）：改为唯一包含原网段的目标前缀父网；
+# 只有目标仍在池内、且新增范围不与其他分配或不可用段重叠才成功，否则 409 回滚
+curl -s -X POST http://localhost:8000/pools/eng/allocations/resize \
+  -H 'Content-Type: application/json' \
+  -d '{"cidr": "10.0.0.128/28", "new_prefix_len": 26}'
+# => {"pool": "eng", "old_cidr": "10.0.0.128/28", "new_cidr": "10.0.0.128/26"}
 
 # 7. IPv6 地址池
 curl -s -X POST http://localhost:8000/pools \
@@ -132,6 +147,7 @@ curl -s http://localhost:8000/pools/eng/snapshots/<snapshot_id>/diff
 | `DELETE` | `/pools/{name}` | 删除地址池（级联删除其不可用段与分配记录） |
 | `POST` | `/pools/{name}/unavailable` | 登记不可用子网 `{cidr}` |
 | `POST` | `/pools/{name}/allocations` | 申请子网 `{requests: [{prefix_len, count?}]}`，批量原子生效 |
+| `POST` | `/pools/{name}/allocations/resize` | 原子调整已分配网段 `{cidr, new_prefix_len}`：缩小保留原网络地址、扩展取唯一父网；返回 `{old_cidr, new_cidr}` |
 | `POST` | `/pools/{name}/plans` | 创建分配计划（请求体同上）：预选子网并返回 `{plan_id, cidrs, expires_at}`，不占用地址 |
 | `POST` | `/pools/{name}/plans/{plan_id}/commit` | 提交计划：未过期、未提交且池状态未变时原子落库，否则 409 |
 | `POST` | `/pools/{name}/snapshots` | 创建不可变快照：在一个 `BEGIN IMMEDIATE` 事务内保存按 CIDR 排序的 allocations 与 unavailable，返回 `snapshot_id` |
@@ -143,9 +159,9 @@ curl -s http://localhost:8000/pools/eng/snapshots/<snapshot_id>/diff
 
 | 状态码 | 场景 |
 | --- | --- |
-| `400` | CIDR 格式非法、越界、地址族（版本）不符、前缀长度非法 |
-| `404` | 地址池不存在、释放的网段不在已分配列表中、计划不存在，或快照不存在（含快照归属其他地址池） |
-| `409` | 任意重叠（池 / 不可用段 / 已分配段）、名称冲突、剩余空间不足（批量申请整体回滚）；计划已过期、已提交或创建后池状态已变化 |
+| `400` | CIDR 格式非法、越界、地址族（版本）不符、前缀长度非法（含 resize 与当前前缀相同） |
+| `404` | 地址池不存在、释放 / 调整的网段不在已分配列表中、计划不存在，或快照不存在（含快照归属其他地址池） |
+| `409` | 任意重叠（池 / 不可用段 / 已分配段）、名称冲突、剩余空间不足（批量申请整体回滚）；resize 扩展目标超出池范围或新增范围与其他分配 / 不可用段重叠（整体回滚，原分配不变）；计划已过期、已提交或创建后池状态已变化 |
 | `422` | 请求体结构不合法（字段缺失、类型错误等） |
 
 ## 本地开发（不用 Docker）
@@ -164,6 +180,7 @@ pytest
 ## 设计说明
 
 - **分配算法**：空闲空间 = 地址池 − 不可用段 − 已分配段，以整数闭区间表示；按区间起点升序找到第一个能容纳指定前缀长度的对齐位置，保证分配结果是"网络地址最小的对齐子网"。
+- **网段原子调整**：`POST /pools/{name}/allocations/resize` 接收现有 `cidr` 与 `new_prefix_len`，在单个 `BEGIN IMMEDIATE` 事务内完成"查池 → 校验前缀边界 / 地址族 → 确认原分配存在 → 计算目标网段 → 校验目标在池内且新增范围无重叠 → UPDATE 落库"，任一步失败即回滚，原分配（含其 `created_at`）保持不变。目标网段的计算：缩小（`new_prefix_len` 更大）时保留原网络地址，即取以其为网络地址的更小子网，原网段尾部空间随之释放并重新计入空闲；扩展（`new_prefix_len` 更小）时按新前缀长度对齐，取**唯一**包含原网段的父网（一个网段在给定前缀长度下有且只有一个父网，其网络地址可能改变，例如 `10.0.0.64/26` 扩展为 `/25` 得到 `10.0.0.0/25`）。扩展仅校验新增范围（目标父网减去原子网）：目标与其他分配或不可用段重叠、或目标不在池内时返回 409；缩小不会产生新的外部重叠，故无需该校验。成功后 `allocations` 中旧 CIDR 消失、新 CIDR 出现——池状态指纹因此自然变化，调整前创建的待提交计划一律失效；快照差异也自然显示为 allocations 的一次 `removed` 与一次 `added`，无需额外维护指纹或快照逻辑。并发调整由 `BEGIN IMMEDIATE` 串行化：目标 CIDR 已被其他事务占用时显式拦截并兜底捕获 `UNIQUE(pool_id, cidr)` 约束冲突，统一返回 409 并回滚。
 - **事务与并发**：所有写操作在 `BEGIN IMMEDIATE` 事务中执行，SQLite 将并发写串行化；批量申请中任何一步失败都会回滚整个事务，因此要么全部落库，要么不产生任何分配，并发申请也不会得到重叠网段。
 - **两阶段计划**：`POST /pools/{name}/plans` 用与直接分配完全相同的选路规则预选子网，把结果（CIDR 列表、10 分钟 `expires_at`、创建时刻的池状态指纹）持久化到 `plans` 表，但不写入 `allocations`，因此计划本身不占用地址，也不影响直接分配。`POST /pools/{name}/plans/{plan_id}/commit` 在同一 `BEGIN IMMEDIATE` 事务内依次校验：计划未提交、未过期、池状态指纹与创建时一致（即分配项与不可用段均未变化），全部满足才按计划批量插入并标记 `committed`；任一不满足返回 409 且不产生任何分配，每个计划只能成功提交一次。计划有效期默认 600 秒，可用环境变量 `CIDR_PLAN_TTL_SECONDS` 调整。
 - **释放合并**：空闲空间由占用集合动态计算，状态接口用 `ipaddress.collapse_addresses` 输出最小 CIDR 集合，释放后相邻空闲段自然重新合并，无需额外维护。

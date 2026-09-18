@@ -52,8 +52,26 @@ def smallest_aligned_network(
     return None
 
 
+def resize_network(net: Network, new_prefix_len: int, version: int) -> Network:
+    """计算调整前缀长度后的目标网段。
+
+    - 缩小（new_prefix_len 更大）：保留原网络地址，取以其为网络地址的更小子网，
+      即把原网段尾部空间释放出来；
+    - 扩展（new_prefix_len 更小）：取唯一包含原网段的目标前缀父网——给定前缀长度
+      时任意网段有且只有一个同长度父网，父网是否仍在池内、是否与其他占用重叠
+      由调用方在同一事务内校验。
+    """
+    base = int(net.network_address)
+    if new_prefix_len >= net.prefixlen:
+        target_base = base  # 缩小：网络地址保持不变
+    else:
+        size = 1 << (max_prefixlen(version) - new_prefix_len)
+        target_base = base // size * size  # 扩展：对齐到唯一父网
+    addr_cls = IPv4Address if version == 4 else IPv6Address
+    return ipaddress.ip_network(f"{addr_cls(target_base)}/{new_prefix_len}")
+
+
 def summarize_free(free: list[tuple[int, int]], version: int) -> list[str]:
-    """把空闲区间归并为最小 CIDR 集合。"""
     addr_cls = IPv4Address if version == 4 else IPv6Address
     nets: list[Network] = []
     for a, b in free:
